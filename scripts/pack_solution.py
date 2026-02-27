@@ -46,15 +46,19 @@ def pack_solution(output_path: Path = None) -> Path:
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
         source_dir = PROJECT_ROOT / "solution" / "cuda"
+    elif language == "cutile":
+        source_dir = PROJECT_ROOT / "solution" / "cutile"
     else:
         raise ValueError(f"Unsupported language: {language}")
 
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
+    build_language = language
+
     # Create build spec
     spec = BuildSpec(
-        language=language,
+        language=build_language,
         target_hardware=["cuda"],
         entry_point=entry_point,
     )
@@ -77,7 +81,7 @@ def pack_solution(output_path: Path = None) -> Path:
     print(f"  Name: {solution.name}")
     print(f"  Definition: {solution.definition}")
     print(f"  Author: {solution.author}")
-    print(f"  Language: {language}")
+    print(f"  Language: {language} (BuildSpec={build_language})")
 
     return output_path
 

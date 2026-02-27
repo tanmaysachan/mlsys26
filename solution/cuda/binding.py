@@ -1,25 +1,62 @@
-"""
-TVM FFI Bindings Template for CUDA Kernels.
+"""Python binding for CUDA GDN decode kernel via TVM FFI.
 
-This file provides Python bindings for your CUDA kernel using TVM FFI.
-The entry point function name should match the `entry_point` setting in config.toml.
-
-See the track definition for required function signature and semantics.
+Used by local scripts (bench_nvbench, profile_ncu) to call the kernel directly.
+The benchmark framework compiles kernel.cu itself via TVMFFIBuilder.
 """
 
-import ctypes
-from tvm.ffi import register_func
+import math
+from pathlib import Path
+
+import torch
+import tvm_ffi
+from tvm_ffi import register_global_func
+
+_mod = None
+
+_CUDA_SRC = str(Path(__file__).parent / "kernel.cu")
 
 
-@register_func("flashinfer.kernel")
-def kernel():
-    """
-    Python binding for your CUDA kernel.
+def _get_mod():
+    global _mod
+    if _mod is None:
+        lib_path = tvm_ffi.cpp.build(
+            name="gdn_decode_cuda_local",
+            cuda_files=[_CUDA_SRC],
+            extra_cuda_cflags=["--use_fast_math"],
+        )
+        _mod = tvm_ffi.load_module(lib_path)
+    return _mod
 
-    TODO: Implement the binding according to the track definition.
-    This function should:
-    1. Accept the inputs as specified by the track definition
-    2. Launch your CUDA kernel with appropriate grid/block dimensions
-    3. Return outputs as specified by the track definition
-    """
-    pass
+
+def _get_fn():
+    return getattr(_get_mod(), "kernel_cuda")
+
+
+@torch.no_grad()
+def kernel_cuda(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
+    """DPS entry point for CUDA GDN decode kernel (v1: 1 warp, BV=8)."""
+    if scale is None or scale == 0.0:
+        scale = 1.0 / math.sqrt(q.shape[-1])
+    fn = _get_fn()
+    fn(q, k, v, state, A_log, a, dt_bias, b, float(scale), output, new_state)
+
+
+def _make_cuda_entry(symbol):
+    """Create a DPS entry point that calls the given TVM FFI symbol."""
+    @torch.no_grad()
+    def entry(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
+        if scale is None or scale == 0.0:
+            scale_ = 1.0 / math.sqrt(q.shape[-1])
+        else:
+            scale_ = float(scale)
+        fn = getattr(_get_mod(), symbol)
+        fn(q, k, v, state, A_log, a, dt_bias, b, scale_, output, new_state)
+    entry.__name__ = symbol
+    return entry
+
+
+kernel_cuda_v4 = _make_cuda_entry("kernel_cuda_v4")
+
+# Register in TVM global table (non-decorator form preserves kwargs support)
+register_global_func("flashinfer.kernel_cuda", kernel_cuda)
+register_global_func("flashinfer.kernel_cuda_v4", kernel_cuda_v4)

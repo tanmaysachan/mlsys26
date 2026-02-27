@@ -31,9 +31,77 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.1-devel-ubuntu22.04",
+        add_python="3.12",
+    )
+    .pip_install("flashinfer-bench", "torch", "triton", "numpy", "flashinfer-python")
 )
+
+
+def _extract_failure_detail(evaluation: Any) -> str:
+    """Best-effort extraction of compiler/runtime error details from evaluation objects."""
+    if evaluation is None:
+        return ""
+
+    interesting = (
+        "error",
+        "errors",
+        "message",
+        "messages",
+        "stderr",
+        "stdout",
+        "traceback",
+        "exception",
+        "log",
+        "logs",
+        "compile",
+        "build",
+        "detail",
+        "reason",
+        "diagnostic",
+    )
+    parts: List[str] = []
+
+    for key in interesting:
+        if hasattr(evaluation, key):
+            value = getattr(evaluation, key)
+            if value:
+                parts.append(f"{key}: {value}")
+
+    dumped = None
+    if hasattr(evaluation, "model_dump"):
+        try:
+            dumped = evaluation.model_dump(mode="json")
+        except TypeError:
+            dumped = evaluation.model_dump()
+    elif hasattr(evaluation, "dict"):
+        dumped = evaluation.dict()
+
+    def _walk(obj: Any, path: str = ""):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                p = f"{path}.{k}" if path else str(k)
+                lk = str(k).lower()
+                if any(tok in lk for tok in interesting):
+                    if v:
+                        parts.append(f"{p}: {v}")
+                _walk(v, p)
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                _walk(v, f"{path}[{i}]")
+
+    if dumped is not None:
+        _walk(dumped)
+
+    if not parts and dumped is not None:
+        parts.append(str(dumped))
+    if not parts:
+        return ""
+
+    # Keep output bounded for terminal readability.
+    detail = "\n".join(str(x) for x in parts)
+    return detail[:8000]
 
 
 def _load_config() -> Dict[str, Dict[str, str]]:
@@ -114,8 +182,15 @@ def _normalize_entry_point(language: str, entry_point: str) -> str:
         return f"kernel.py::{entry_point}"
     if language == "cuda":
         return f"kernel.cu::{entry_point}"
+    if language == "cutile":
+        return f"kernel.py::{entry_point}"
 
     raise ValueError(f"Unsupported language in config.toml: {language}")
+
+
+def _build_language(language: str) -> str:
+    """Map local source flavors onto benchmark builder languages."""
+    return language
 
 
 def _build_solution_payload() -> Dict[str, Any]:
@@ -137,6 +212,8 @@ def _build_solution_payload() -> Dict[str, Any]:
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
         source_dir = PROJECT_ROOT / "solution" / "cuda"
+    elif language == "cutile":
+        source_dir = PROJECT_ROOT / "solution" / "cutile"
     else:
         raise ValueError(f"Unsupported language in config.toml: {language}")
 
@@ -164,7 +241,7 @@ def _build_solution_payload() -> Dict[str, Any]:
             "author": solution_cfg["author"],
         },
         "build": {
-            "language": build_cfg["language"],
+            "language": _build_language(build_cfg["language"]),
             "entry_point": normalized_entry_point,
         },
         "sources": sources,
@@ -174,84 +251,106 @@ def _build_solution_payload() -> Dict[str, Any]:
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(solution_payload: Dict[str, Any], config: Dict[str, int] = None) -> Dict[str, Any]:
     """Run benchmark on Modal B200 and return results."""
+    import traceback
+
     from flashinfer_bench import Benchmark, BenchmarkConfig, BuildSpec, TraceSet
     from flashinfer_bench.agents import pack_solution_from_files
 
-    if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
-    else:
-        config = BenchmarkConfig(**config)
+    try:
+        if config is None:
+            config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        else:
+            config = BenchmarkConfig(**config)
 
-    trace_set = TraceSet.from_path(TRACE_SET_PATH)
+        trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
-    requested_definition = solution_payload["solution"]["definition"]
-    resolved_definition = _resolve_definition_name(
-        requested_definition,
-        trace_set.definitions.keys(),
-    )
-
-    with TemporaryDirectory() as tmp_dir:
-        source_dir = Path(tmp_dir) / "solution_src"
-        source_dir.mkdir(parents=True, exist_ok=True)
-
-        for source in solution_payload["sources"]:
-            dst = source_dir / source["path"]
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text(source["content"])
-
-        build_spec = BuildSpec(
-            language=solution_payload["build"]["language"],
-            target_hardware=["cuda"],
-            entry_point=solution_payload["build"]["entry_point"],
-        )
-        solution = pack_solution_from_files(
-            path=str(source_dir),
-            spec=build_spec,
-            name=solution_payload["solution"]["name"],
-            definition=resolved_definition,
-            author=solution_payload["solution"]["author"],
+        requested_definition = solution_payload["solution"]["definition"]
+        resolved_definition = _resolve_definition_name(
+            requested_definition,
+            trace_set.definitions.keys(),
         )
 
-    definition = trace_set.definitions[solution.definition]
-    workloads = trace_set.workloads.get(solution.definition, [])
+        with TemporaryDirectory() as tmp_dir:
+            source_dir = Path(tmp_dir) / "solution_src"
+            source_dir.mkdir(parents=True, exist_ok=True)
 
-    if not workloads:
-        raise ValueError(f"No workloads found for definition '{solution.definition}'")
+            for source in solution_payload["sources"]:
+                dst = source_dir / source["path"]
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_text(source["content"])
 
-    bench_trace_set = TraceSet(
-        root=trace_set.root,
-        definitions={definition.name: definition},
-        solutions={definition.name: [solution]},
-        workloads={definition.name: workloads},
-        traces={definition.name: []},
-    )
+            build_spec = BuildSpec(
+                language=solution_payload["build"]["language"],
+                target_hardware=["cuda"],
+                entry_point=solution_payload["build"]["entry_point"],
+            )
+            solution = pack_solution_from_files(
+                path=str(source_dir),
+                spec=build_spec,
+                name=solution_payload["solution"]["name"],
+                definition=resolved_definition,
+                author=solution_payload["solution"]["author"],
+            )
 
-    benchmark = Benchmark(bench_trace_set, config)
-    result_trace_set = benchmark.run_all(dump_traces=True)
+        definition = trace_set.definitions[solution.definition]
+        workloads = trace_set.workloads.get(solution.definition, [])
 
-    traces = result_trace_set.traces.get(definition.name, [])
-    results = {definition.name: {}}
+        if not workloads:
+            raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
-    for trace in traces:
-        if trace.evaluation:
-            entry = {
-                "status": trace.evaluation.status.value,
-                "solution": trace.solution,
-            }
-            if trace.evaluation.performance:
-                entry["latency_ms"] = trace.evaluation.performance.latency_ms
-                entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
-                entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
-            if trace.evaluation.correctness:
-                entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
-                entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
-            results[definition.name][trace.workload.uuid] = entry
+        bench_trace_set = TraceSet(
+            root=trace_set.root,
+            definitions={definition.name: definition},
+            solutions={definition.name: [solution]},
+            workloads={definition.name: workloads},
+            traces={definition.name: []},
+        )
 
-    return results
+        benchmark = Benchmark(bench_trace_set, config)
+        result_trace_set = benchmark.run_all(dump_traces=True)
+
+        traces = result_trace_set.traces.get(definition.name, [])
+        results = {definition.name: {}}
+
+        for trace in traces:
+            if trace.evaluation:
+                entry = {
+                    "status": trace.evaluation.status.value,
+                    "solution": trace.solution,
+                }
+                if trace.evaluation.performance:
+                    entry["latency_ms"] = trace.evaluation.performance.latency_ms
+                    entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
+                    entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
+                if trace.evaluation.correctness:
+                    entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
+                    entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+
+                detail = _extract_failure_detail(trace.evaluation)
+                if detail:
+                    entry["error_detail"] = detail
+
+                results[definition.name][trace.workload.uuid] = entry
+
+        return results
+    except Exception as exc:  # Keep remote failures inspectable from local logs.
+        return {
+            "__remote_error__": str(exc),
+            "__remote_traceback__": traceback.format_exc(),
+        }
 
 
 def print_results(results: dict):
     """Print benchmark results in a formatted way."""
+    if "__remote_error__" in results:
+        print("\nRemote benchmark error:")
+        print(results["__remote_error__"])
+        tb = results.get("__remote_traceback__")
+        if tb:
+            print("\nRemote traceback:")
+            print(tb)
+        return
+
     for def_name, traces in results.items():
         print(f"\n{def_name}:")
         for workload_uuid, result in traces.items():
@@ -270,6 +369,10 @@ def print_results(results: dict):
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
 
             print()
+            if result.get("error_detail"):
+                print("    error_detail:")
+                for line in str(result["error_detail"]).splitlines():
+                    print(f"      {line}")
 
 
 @app.local_entrypoint()
